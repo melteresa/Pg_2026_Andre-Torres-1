@@ -1,152 +1,244 @@
-﻿import uasyncio as asyncio
+﻿"""
+main.py - Servidor web y gestor de UART para ESP32
+Levanta servidor en puerto 80, recibe comandos web y los envía al Arduino
+"""
+
+import uasyncio as asyncio
 import time
 from machine import Pin, UART
 
+# ==================== CONFIGURACIÓN ====================
 STATUS_LED_PIN = 2
 UART_BAUD = 9600
-COMMAND_TIMEOUT_MS = 500
+UART_TX = 17          # GPIO17 -> RX del Arduino Nano
+UART_RX = 16          # GPIO16 <- TX del Arduino Nano (opcional, para lectura)
+COMMAND_TIMEOUT_MS = 800  # Timeout para envío automático de STOP
+
 HOST = "0.0.0.0"
 PORT = 80
 
+# ==================== INICIALIZACIÓN ====================
 led = Pin(STATUS_LED_PIN, Pin.OUT)
-led.value(1)
+led.on()  # Encendido mientras corre
 
-uart = UART(2, baudrate=UART_BAUD, tx=Pin(17), rx=Pin(16))
-last_command_ms = time.ticks_ms()
+# UART: comunicación con Arduino Nano
+uart = UART(2, baudrate=UART_BAUD, tx=Pin(UART_TX), rx=Pin(UART_RX), timeout=100)
+
+# Variables de control
+last_command_time = time.ticks_ms()
 stop_sent = False
 
-INDEX_HTML = """
-<!DOCTYPE html>
+print("[MAIN] UART configurada: TX=GPIO17, RX=GPIO16, Baudrate=9600 bps")
+
+# ==================== FUNCIONES AUXILIARES ====================
+def validate_command(cmd):
+    """Valida que el comando sea uno de los permitidos"""
+    valid = ('F', 'B', 'L', 'R', 'U', 'D', 'S')
+    return cmd.upper() in valid if len(cmd) == 1 else False
+
+async def send_uart_command(cmd):
+    """Envía comando al Arduino por UART"""
+    global last_command_time, stop_sent
+    
+    if validate_command(cmd):
+        cmd_upper = cmd.upper()
+        uart.write(cmd_upper)
+        print(f"[UART] Enviado: {cmd_upper}")
+        last_command_time = time.ticks_ms()
+        stop_sent = False
+        return True
+    return False
+
+async def load_html_file():
+    """Carga el HTML del archivo, fallback a HTML embebido"""
+    try:
+        with open('Index.html', 'r') as f:
+            content = f.read()
+            print("[HTML] Cargado desde Index.html")
+            return content
+    except OSError:
+        print("[HTML] Index.html no encontrado, usando fallback")
+        return get_fallback_html()
+
+def get_fallback_html():
+    """HTML fallback si el archivo no existe"""
+    return """<!DOCTYPE html>
 <html lang="es">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Control Remoto de la Grua</title>
-  <style>
-    body { margin: 0; font-family: Arial, sans-serif; background: #0f172a; color: #f8fafc; display: flex; flex-direction: column; min-height: 100vh; }
-    header { padding: 18px 16px; text-align: center; background: #111827; box-shadow: 0 2px 12px rgba(0,0,0,.25); }
-    h1 { margin: 0; font-size: 1.5rem; }
-    .status { font-size: 0.95rem; margin-top: 6px; color: #93c5fd; }
-    .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; padding: 20px; width: min(100%, 520px); margin: 0 auto; }
-    .control-btn { border: none; border-radius: 16px; padding: 22px 10px; font-size: 1.05rem; font-weight: 700; color: #fff; background: linear-gradient(135deg,#2563eb,#7dd3fc); box-shadow: 0 10px 20px rgba(0,0,0,.25); cursor: pointer; transition: transform .15s ease, filter .15s ease; }
-    .control-btn:active { transform: scale(0.97); filter: brightness(1.05); }
-    .control-btn.stop { background: #dc2626; }
-    .wide { grid-column: span 2; }
-    footer { margin-top: auto; padding: 16px; text-align: center; font-size: 0.9rem; color: #94a3b8; }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Control de Grúa</title>
+    <style>
+        body { background: #0a1929; color: #e8f4f8; font-family: Arial; margin: 0; }
+        .container { max-width: 500px; margin: 20px auto; text-align: center; }
+        h1 { color: #00a8e8; }
+        .btn { padding: 15px 20px; margin: 5px; font-size: 16px; border: none; border-radius: 8px; 
+               background: #0080d0; color: white; cursor: pointer; transition: 0.2s; }
+        .btn:hover { background: #0098e8; }
+        .btn.stop { background: #d42426; }
+        .status { margin: 20px 0; padding: 10px; background: #1a4a6c; border-radius: 8px; }
+    </style>
 </head>
 <body>
-  <header>
-    <h1>Panel de Control de Grua</h1>
-    <div class="status" id="status">Estado: listo</div>
-  </header>
-
-  <main class="grid">
-    <button class="control-btn" onclick="sendCommand('F')">Adelante</button>
-    <button class="control-btn" onclick="sendCommand('B')">Atrás</button>
-    <button class="control-btn" onclick="sendCommand('L')">Izquierda</button>
-    <button class="control-btn" onclick="sendCommand('R')">Derecha</button>
-    <button class="control-btn" onclick="sendCommand('U')">Subir</button>
-    <button class="control-btn" onclick="sendCommand('D')">Bajar</button>
-    <button class="control-btn stop wide" onclick="sendCommand('S')">Parar</button>
-  </main>
-
-  <footer>Usa el servidor web para enviar comandos UART de forma segura.</footer>
-
-  <script>
-    async function sendCommand(command) {
-      try {
-        const response = await fetch(`/cmd?m=${command}`);
-        if (!response.ok) throw new Error('Error de red');
-        document.getElementById('status').textContent = `Último comando: ${command}`;
-      } catch (error) {
-        document.getElementById('status').textContent = 'Error de conexión';
-      }
-    }
-  </script>
+    <div class="container">
+        <h1>🏗️ Control de Grúa</h1>
+        <div class="status" id="status">Conectado</div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+            <button class="btn" onclick="send('F')">⬆️ Adelante</button>
+            <button class="btn" onclick="send('B')">⬇️ Atrás</button>
+            <button class="btn" onclick="send('L')">⬅️ Izq</button>
+            <button class="btn" onclick="send('R')">➡️ Der</button>
+            <button class="btn" onclick="send('U')">⬆️ Subir</button>
+            <button class="btn" onclick="send('D')">⬇️ Bajar</button>
+            <button class="btn stop" onclick="send('S')" style="grid-column: 1/-1;">🛑 STOP</button>
+        </div>
+    </div>
+    <script>
+        async function send(cmd) {
+            try {
+                const res = await fetch('/command', { method: 'POST', body: cmd });
+                if (res.ok) document.getElementById('status').textContent = 'Comando: ' + cmd;
+            } catch (e) { document.getElementById('status').textContent = 'Error'; }
+        }
+    </script>
 </body>
-</html>
-"""
+</html>"""
 
-
-def get_index_html():
-    try:
-        with open('Index.html', 'r') as page:
-            return page.read()
-    except OSError:
-        return INDEX_HTML
-
-
-async def send_serial_command(cmd):
-    global last_command_ms, stop_sent
-    uart.write(cmd)
-    last_command_ms = time.ticks_ms()
-    stop_sent = False
-
-
+# ==================== SERVIDOR HTTP ====================
 async def handle_client(reader, writer):
-    request_line = await reader.readline()
-    if not request_line:
-        await writer.aclose()
-        return
-
-    request = request_line.decode('utf-8')
-    path = request.split(' ')[1]
-
-    while True:
-        header = await reader.readline()
-        if not header or header == b'\r\n':
-            break
-
-    if path == '/':
-        body = get_index_html()
-        response = 'HTTP/1.0 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}'.format(len(body), body)
-        writer.write(response.encode('utf-8'))
+    """Maneja solicitudes HTTP"""
+    try:
+        request_line = await reader.readline()
+        if not request_line:
+            await writer.aclose()
+            return
+        
+        request = request_line.decode('utf-8').strip()
+        print(f"[HTTP] {request}")
+        
+        # Parsear ruta y método
+        parts = request.split(' ')
+        method = parts[0]
+        path = parts[1] if len(parts) > 1 else '/'
+        
+        # Leer headers
+        while True:
+            header = await reader.readline()
+            if not header or header == b'\r\n':
+                break
+        
+        # Leer body si es POST
+        body = b''
+        if method == 'POST':
+            while True:
+                chunk = await reader.read(1)
+                if not chunk:
+                    break
+                body += chunk
+        
+        # ========== RUTAS ==========
+        
+        # GET / -> Servir HTML
+        if path == '/' and method == 'GET':
+            html = await load_html_file()
+            response = f"""HTTP/1.0 200 OK\r
+Content-Type: text/html; charset=utf-8\r
+Content-Length: {len(html)}\r
+Connection: close\r
+\r
+{html}"""
+            writer.write(response.encode())
+            await writer.drain()
+            await writer.aclose()
+            return
+        
+        # POST /command -> Recibir comando
+        if path == '/command' and method == 'POST':
+            cmd = body.decode('utf-8').strip()
+            
+            if await send_uart_command(cmd):
+                response_body = '{"status":"ok","command":"' + cmd.upper() + '"}'
+                response = f"""HTTP/1.0 200 OK\r
+Content-Type: application/json\r
+Content-Length: {len(response_body)}\r
+Connection: close\r
+\r
+{response_body}"""
+            else:
+                response_body = '{"status":"error","message":"Comando inválido"}'
+                response = f"""HTTP/1.0 400 Bad Request\r
+Content-Type: application/json\r
+Content-Length: {len(response_body)}\r
+Connection: close\r
+\r
+{response_body}"""
+            
+            writer.write(response.encode())
+            await writer.drain()
+            await writer.aclose()
+            return
+        
+        # 404
+        response_body = '<h1>404 No encontrado</h1>'
+        response = f"""HTTP/1.0 404 Not Found\r
+Content-Type: text/html\r
+Content-Length: {len(response_body)}\r
+Connection: close\r
+\r
+{response_body}"""
+        writer.write(response.encode())
         await writer.drain()
         await writer.aclose()
-        return
-
-    if path.startswith('/cmd'):
-        command = None
-        if 'm=' in path:
-            command = path.split('m=')[1].split('&')[0][:1].upper()
-
-        if command in ('F', 'B', 'L', 'R', 'U', 'D', 'S'):
-            await send_serial_command(command)
-            body = '{{"status":"ok","command":"{}"}}'.format(command)
-            response = 'HTTP/1.0 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}'.format(len(body), body)
-        else:
-            body = '{{"status":"error","message":"Comando inválido"}}'
-            response = 'HTTP/1.0 400 Bad Request\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}'.format(len(body), body)
-
-        writer.write(response.encode('utf-8'))
-        await writer.drain()
+        
+    except Exception as e:
+        print(f"[ERROR] {e}")
         await writer.aclose()
-        return
 
-    body = '<h1>404 No encontrado</h1>'
-    response = 'HTTP/1.0 404 Not Found\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}'.format(len(body), body)
-    writer.write(response.encode('utf-8'))
-    await writer.drain()
-    await writer.aclose()
-
-
+# ==================== WATCHDOG ====================
 async def watchdog():
+    """
+    Monitorea timeout: envía STOP automático si no hay comandos
+    Útil para seguridad en caso de desconexión web
+    """
     global stop_sent
+    
     while True:
-        await asyncio.sleep_ms(200)
-        elapsed = time.ticks_diff(time.ticks_ms(), last_command_ms)
+        await asyncio.sleep_ms(300)
+        elapsed = time.ticks_diff(time.ticks_ms(), last_command_time)
+        
         if elapsed > COMMAND_TIMEOUT_MS and not stop_sent:
             uart.write('S')
+            print("[WATCHDOG] STOP automático (timeout)")
             stop_sent = True
 
-
+# ==================== MAIN ====================
 async def main():
+    """Corre el servidor web y el watchdog"""
+    print("\n" + "="*50)
+    print("🏗️  SERVIDOR ESP32 - CONTROL DE GRÚA")
+    print("="*50)
+    print(f"[HTTP] Servidor iniciado en http://0.0.0.0:{PORT}")
+    print(f"[UART] Escuchando comandos en GPIO17 @ {UART_BAUD} bps")
+    print("="*50 + "\n")
+    
+    # Inicia servidor
     server = await asyncio.start_server(handle_client, HOST, PORT)
-    print('Servidor activo en http://{}:{}'.format(HOST, PORT))
+    
+    # Inicia watchdog
     asyncio.create_task(watchdog())
+    
+    # Espera indefinidamente
     await server.wait_closed()
 
+# ==================== INICIO ====================
+try:
+    asyncio.run(main())
+except KeyboardInterrupt:
+    print("\n[MAIN] Servidor detenido por usuario")
+    led.off()
+except Exception as e:
+    print(f"[ERROR] {e}")
+    led.off()
 
 try:
     asyncio.run(main())
